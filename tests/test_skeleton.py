@@ -95,8 +95,9 @@ def placeholder_modules() -> list[Path]:
 
 def test_placeholders_exist_for_later_phases() -> None:
     # Phase 2 turned six of them into real modules, Phase 3 three more (registry,
-    # calculator, algebra plus the new sandbox); the rest belong to Phases 4–9.
-    assert len(placeholder_modules()) >= 12
+    # calculator, algebra plus the new sandbox), Phase 4 the verifier; the rest belong
+    # to Phases 6–9.
+    assert len(placeholder_modules()) >= 11
 
 
 @pytest.mark.parametrize("script", ["start_llama.sh", "benchmark_model.sh", "smoke_test.sh"])

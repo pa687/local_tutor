@@ -47,6 +47,14 @@ def app_client(config: AppConfig, llama: LlamaClient) -> TestClient:
     return TestClient(create_app(config, llama_client=llama))
 
 
+def verification_of(payload: str) -> dict[str, object]:
+    """The ``verification`` object of the ``done`` event, narrowed for the assertions."""
+    done = dict(parse_sse(payload))["done"]
+    verification = done["verification"]
+    assert isinstance(verification, dict)
+    return cast(dict[str, object], verification)
+
+
 class DyingClient:
     """Classifies fine, streams one token, then the backend dies (OOM/crash case)."""
 
@@ -185,6 +193,78 @@ class TestBackendFailures:
         assert events[2][1]["error"] == "LlamaUnavailableError"
 
 
+class TestVerificationContract:
+    """§7 over SSE: the tools' verdict and any correction must be visible to the client."""
+
+    QUADRATIC = "解方程 x^2 - 5*x + 6 = 0"
+    GOOD = "所以 x = 2 或 x = 3"
+    BAD = "所以 x = 4"
+
+    def test_a_verified_answer_is_reported_with_its_tool_trail(
+        self, test_config: AppConfig, tutor_llama: Factory
+    ) -> None:
+        with app_client(test_config, tutor_llama(tokens=(self.GOOD,))) as client:
+            response = client.post("/api/chat", json={**REQUEST, "message": self.QUADRATIC})
+
+        events = parse_sse(response.text)
+        assert [name for name, _ in events] == ["start", "token", "done"]
+        done = dict(events)["done"]
+        verification = done["verification"]
+        assert isinstance(verification, dict)
+        assert verification["status"] == "verified"
+        assert verification["attempts"] == 0
+        assert [check["satisfied"] for check in verification["checks"]] == [True, True]
+        # §17: the audit trail shows what really ran, arguments included.
+        assert verification["tools"][0]["tool"] == "evaluate_expression"
+        assert verification["tools"][0]["ok"] is True
+        assert done["tools_used"] == ["evaluate_expression"]
+
+    def test_a_conflict_streams_a_revision_then_the_corrected_answer(
+        self, test_config: AppConfig, tutor_llama: Factory
+    ) -> None:
+        llama = tutor_llama(answers=[(self.BAD,), (self.GOOD,)])
+        with app_client(test_config, llama) as client:
+            response = client.post("/api/chat", json={**REQUEST, "message": self.QUADRATIC})
+
+        events = parse_sse(response.text)
+        assert [name for name, _ in events] == ["start", "token", "revision", "token", "done"]
+        revision = events[2][1]
+        assert revision["attempt"] == 1
+        assert "x = 4" in str(revision["detail"])
+        assert events[3][1]["text"] == self.GOOD
+        done = events[-1][1]
+        assert verification_of(response.text)["attempts"] == 1
+        assert verification_of(response.text)["status"] == "verified"
+        assert done["warnings"] == []
+
+    def test_an_unresolved_conflict_is_visible_and_costs_confidence(
+        self, test_config: AppConfig, tutor_llama: Factory
+    ) -> None:
+        with app_client(test_config, tutor_llama(tokens=(self.BAD,))) as client:
+            response = client.post("/api/chat", json={**REQUEST, "message": self.QUADRATIC})
+
+        done = dict(parse_sse(response.text))["done"]
+        verification = verification_of(response.text)
+        assert verification["status"] == "conflict"
+        assert verification["attempts"] == 2  # config: max_verification_attempts
+        assert done["confidence"] == "low"
+        warnings = cast(list[str], done["warnings"])
+        assert any("冲突" in warning for warning in warnings)
+
+    def test_a_student_check_reports_the_student_verdict(
+        self, test_config: AppConfig, tutor_llama: Factory
+    ) -> None:
+        message = "题目是 x^2 - 5*x + 6 = 0，我的过程是 (x-2)(x-3)，所以 x = 2，5，对了吗？"
+        with app_client(test_config, tutor_llama()) as client:
+            response = client.post(
+                "/api/chat", json={**REQUEST, "mode": "check", "message": message}
+            )
+
+        verification = verification_of(response.text)
+        assert verification["student_status"] == "conflict"
+        assert "x = 5" in str(verification["student_detail"])
+
+
 class TestValidation:
     @pytest.mark.parametrize("missing", ["student_id", "conversation_id", "message"])
     def test_required_fields(self, client: TestClient, missing: str) -> None:
@@ -224,4 +304,5 @@ class TestLogging:
         assert payload["prompt_tokens"] == 11
         assert payload["completion_tokens"] == 2
         assert payload["tools_used"] == []
+        assert payload["verification_status"] == "nothing_to_verify"
         assert "sign flip" not in caplog.text

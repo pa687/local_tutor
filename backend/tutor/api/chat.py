@@ -9,17 +9,20 @@ no prompt text, no policy rule and no direct model call — §6 forbids it and
 SSE contract (also documented in README):
 
     event: start   data: {"request_id", "model", "mode", "subject", "estimated_grade",
-                          "topic", "confidence", "warnings"}
+                          "topic", "confidence", "tools_used", "warnings"}
     event: token   data: {"text": "..."}
+    event: revision data: {"attempt": 1, "detail": "..."}   # discard the text so far
     event: done    data: {"request_id", "prompt_tokens", "completion_tokens",
                           "latency_ms", "mode", "subject", "estimated_grade", "topic",
-                          "confidence", "tools_used", "warnings"}
+                          "confidence", "tools_used", "warnings", "verification"}
     event: error   data: {"error", "detail"}
 
 ``start`` and ``done`` carry the same metadata shape; ``start`` reports it before the
 first token (with the baseline confidence) and ``done`` after the answer has been
-inspected (with the final confidence and any policy warnings). ``answer`` is not
-repeated in ``done`` — the client already has it from the ``token`` events.
+inspected (with the final confidence, any policy warnings, and the §7 verification
+verdict). ``answer`` is not repeated in ``done`` — the client already has it from the
+``token`` events. A ``revision`` event means the tools contradicted the answer and a
+corrected pass follows: the client must drop the text it has buffered so far (§7).
 
 Failures before the first token are reported as HTTP status codes (503 / 504 / 502 /
 422) so callers do not have to parse a stream to learn the request cannot be served.
@@ -52,8 +55,10 @@ from tutor.tutor.response import (
     TutorEvent,
     TutorMode,
     TutorResponse,
+    TutorRevisionEvent,
     TutorStartEvent,
     TutorTokenEvent,
+    VerificationSummary,
 )
 
 router = APIRouter(prefix="/api", tags=["chat"])
@@ -148,6 +153,7 @@ async def chat(payload: ChatRequest, request: Request) -> StreamingResponse:
         prompt_tokens: int | None = None
         completion_tokens: int | None = None
         final: TutorResponse | None = None
+        verification: VerificationSummary | None = None
         try:
             async for event in _chain(first, events):
                 if isinstance(event, TutorStartEvent):
@@ -157,8 +163,14 @@ async def chat(payload: ChatRequest, request: Request) -> StreamingResponse:
                     )
                 elif isinstance(event, TutorTokenEvent):
                     yield _sse("token", {"text": event.text})
+                elif isinstance(event, TutorRevisionEvent):
+                    logger.info(
+                        "chat revision %s after a tool conflict: %s", event.attempt, event.detail
+                    )
+                    yield _sse("revision", {"attempt": event.attempt, "detail": event.detail})
                 elif isinstance(event, TutorDoneEvent):
                     final = event.response
+                    verification = event.verification
                     prompt_tokens = event.prompt_tokens or prompt_tokens
                     completion_tokens = event.completion_tokens or completion_tokens
                     yield _sse(
@@ -169,6 +181,11 @@ async def chat(payload: ChatRequest, request: Request) -> StreamingResponse:
                             "completion_tokens": completion_tokens,
                             "latency_ms": round((time.perf_counter() - started_at) * 1000, 3),
                             **_metadata(final),
+                            "verification": (
+                                verification.model_dump(mode="json")
+                                if verification is not None
+                                else None
+                            ),
                         },
                     )
         except LlamaClientError as exc:
@@ -186,6 +203,9 @@ async def chat(payload: ChatRequest, request: Request) -> StreamingResponse:
                     completion_tokens=completion_tokens,
                     latency_ms=round((time.perf_counter() - started_at) * 1000, 3),
                     tools_used=final.tools_used if final is not None else (),
+                    verification_status=(
+                        verification.status.value if verification is not None else None
+                    ),
                 ),
                 event="chat.completed",
             )

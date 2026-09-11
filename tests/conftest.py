@@ -107,21 +107,25 @@ def llama_client_factory() -> Callable[..., LlamaClient]:
 def tutor_llama(llama_client_factory: Callable[..., LlamaClient]) -> Callable[..., LlamaClient]:
     """A fake llama-server that serves both call shapes the engine uses.
 
-    Phase 2 makes two calls per turn: a non-streaming classification call and a
-    streaming answer. The handler branches on the ``stream`` flag of the payload, so
-    tests exercise the real :class:`LlamaClient` on both paths.
+    Every turn makes a non-streaming classification call plus one streaming call per
+    answer pass, so the handler branches on the ``stream`` flag and can serve a
+    *different* answer for the first pass and for the §7 revision (``answers``).
     """
 
     def factory(
         *,
         classification: str | None = CLASSIFICATION_JSON,
         tokens: Sequence[str] = ("Hel", "lo"),
+        answers: Sequence[Sequence[str]] | None = None,
         prompt_tokens: int = 11,
         completion_tokens: int = 2,
         classify_error: Exception | None = None,
         stream_error: Exception | None = None,
         capture: list[dict[str, Any]] | None = None,
     ) -> LlamaClient:
+        passes: list[Sequence[str]] = list(answers) if answers is not None else [tokens]
+        served = {"count": 0}
+
         def handler(request: httpx.Request) -> httpx.Response:
             payload: dict[str, Any] = json.loads(request.content)
             if capture is not None:
@@ -131,7 +135,9 @@ def tutor_llama(llama_client_factory: Callable[..., LlamaClient]) -> Callable[..
                     return stream_error
                 if stream_error is not None:
                     raise stream_error
-                body = "".join(sse_content_chunk(token) for token in tokens)
+                index = min(served["count"], len(passes) - 1)
+                served["count"] += 1
+                body = "".join(sse_content_chunk(token) for token in passes[index])
                 body += sse_final_chunks(prompt_tokens, completion_tokens)
                 body += "data: [DONE]\n\n"
                 return httpx.Response(200, text=body)

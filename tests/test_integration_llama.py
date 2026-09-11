@@ -28,7 +28,15 @@ from tutor.llm.client import LlamaClient
 from tutor.llm.prompts import get_prompt_library
 from tutor.main import create_app
 from tutor.tutor.engine import ConversationRef, StudentRef, TutorEngine
-from tutor.tutor.response import Confidence, Subject, TutorMode, TutorResponse
+from tutor.tutor.response import (
+    Confidence,
+    Subject,
+    TutorDoneEvent,
+    TutorMode,
+    TutorResponse,
+    VerificationStatus,
+    VerificationSummary,
+)
 
 pytestmark = [
     pytest.mark.integration,
@@ -108,8 +116,72 @@ def test_unreachable_server_does_not_break_the_backend() -> None:
         assert client.get("/health").json()["llama"] == "down"
 
 
-# --------------------------------------------------------------------- Phase 2
+# --------------------------------------------------------------------- Phase 4
 
+
+async def _turn(
+    query: str, *, mode: TutorMode, grade: int = 9
+) -> tuple[TutorResponse, VerificationSummary]:
+    """One turn against the live model, through the engine's §6 core interface."""
+    config = get_config()
+    client = LlamaClient(config.llm)
+    try:
+        engine = TutorEngine(client, get_prompt_library(), config)
+        response: TutorResponse | None = None
+        verification: VerificationSummary | None = None
+        async for event in engine.stream(
+            StudentRef(id="integration-student", grade=grade),
+            ConversationRef(id="integration-conversation"),
+            query,
+            mode=mode,
+        ):
+            if isinstance(event, TutorDoneEvent):
+                response = event.response
+                verification = event.verification
+        assert response is not None, "the engine produced no answer"
+        assert verification is not None, "the engine produced no verification summary"
+        return response, verification
+    finally:
+        await client.aclose()
+
+
+async def test_case_a_answer_is_verified_by_sympy() -> None:
+    """§22 Case A: 解 x² - 5x + 6 = 0 → 正确解答，且结果由 SymPy 验证。"""
+    response, verification = await _turn(
+        "解方程 x^2 - 5*x + 6 = 0，请给出完整解答。", mode=TutorMode.EXPLAIN
+    )
+    assert response.answer.strip()
+    assert response.tools_used == ("evaluate_expression",), response.warnings
+    assert verification.status is VerificationStatus.VERIFIED, verification.detail
+    assert verification.attempts == 0
+    assert response.warnings == ()
+    assert response.confidence is not Confidence.LOW
+
+
+async def test_case_b_student_answer_is_verified_by_the_tools() -> None:
+    """§22 Case B: 学生给出 x=2,3 → 由工具确认，不是凭感觉点头。"""
+    response, verification = await _turn(
+        "题目是 x^2 - 5*x + 6 = 0，我算出来 x = 2，x = 3，对吗？", mode=TutorMode.CHECK
+    )
+    assert response.answer.strip()
+    assert response.tools_used == ("evaluate_expression",), response.warnings
+    assert verification.student_status is VerificationStatus.VERIFIED, verification.student_detail
+
+
+async def test_case_e_wrong_student_work_is_caught_by_the_tools() -> None:
+    """§22 Case E: 学生的答案错了 → 工具在校验阶段就抓住它。"""
+    response, verification = await _turn(
+        "题目是 x^2 - 5*x + 6 = 0，我的过程：(x - 2)(x + 3) = 0，所以 x = 2 或 x = -3",
+        mode=TutorMode.CHECK,
+    )
+    assert response.answer.strip()
+    assert response.tools_used == ("evaluate_expression",), response.warnings
+    assert verification.student_status is VerificationStatus.CONFLICT, verification.student_detail
+    assert verification.student_detail is not None
+    assert "-3" in verification.student_detail
+
+
+# ------------------------------------------------------------ Phase 2/4 over HTTP
 
 MATH_MESSAGE = "解方程 x^2 - 5x + 6 = 0"
 MATH_REQUEST = {

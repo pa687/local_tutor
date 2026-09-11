@@ -18,8 +18,11 @@ from tutor.config import AppConfig, LLMConfig, MemoryConfig
 from tutor.llm.client import LlamaClient, LlamaTimeoutError, LlamaUnavailableError
 from tutor.llm.models import ChatMessage
 from tutor.llm.prompts import PromptLibrary
+from tutor.tools.calculator import EvaluateArgs
+from tutor.tools.registry import ToolRegistry, ToolSpec, ToolUnsupported, build_default_registry
 from tutor.tutor.engine import (
     EMPTY_ANSWER_WARNING,
+    UNVERIFIABLE_WARNING,
     ConversationRef,
     StudentRef,
     TutorEngine,
@@ -31,18 +34,20 @@ from tutor.tutor.response import (
     TutorEvent,
     TutorMode,
     TutorResponse,
+    TutorRevisionEvent,
     TutorStartEvent,
     TutorTokenEvent,
+    VerificationStatus,
 )
+from tutor.tutor.verifier import Verifier
 
 Factory = Callable[..., LlamaClient]
-QUESTION = "解 x^2 - 5x + 6 = 0"
+QUESTION = "解 x^2 - 5*x + 6 = 0"
 
 
-def build_engine(
-    llama: LlamaClient, prompts: PromptLibrary, *, enable_thinking: bool = False
-) -> TutorEngine:
-    config = AppConfig(
+def engine_config(*, enable_thinking: bool = False) -> AppConfig:
+    """The engine configuration used by these tests."""
+    return AppConfig(
         llm=LLMConfig(
             base_url="http://llama.test",
             model="qwen3.5-9b",
@@ -50,7 +55,37 @@ def build_engine(
         ),
         memory=MemoryConfig(),
     )
-    return TutorEngine(llama, prompts, config)
+
+
+def failing_verifier() -> Verifier:
+    """A verifier whose only tool always gives up — §7's "试过但无法验证"."""
+
+    def give_up(_: EvaluateArgs) -> dict[str, object]:
+        raise ToolUnsupported("sympy cannot evaluate this expression")
+
+    registry: ToolRegistry = build_default_registry()
+    registry.register(
+        ToolSpec(
+            name="evaluate_expression",
+            description="always fails",
+            arguments=EvaluateArgs,
+            handler=give_up,
+        ),
+        replace=True,
+    )
+    return Verifier(registry)
+
+
+def build_engine(
+    llama: LlamaClient,
+    prompts: PromptLibrary,
+    *,
+    enable_thinking: bool = False,
+    verifier: Verifier | None = None,
+) -> TutorEngine:
+    return TutorEngine(
+        llama, prompts, engine_config(enable_thinking=enable_thinking), verifier=verifier
+    )
 
 
 async def collect(
@@ -229,6 +264,225 @@ class TestRespond:
         )
         assert response.answer == "x = 2, 3"
         assert response.confidence is Confidence.HIGH
+
+
+class TestVerificationLoop:
+    """§7: the tools check the answer, a conflict forces a re-check, nothing is hidden."""
+
+    QUADRATIC = "解方程 x^2 - 5*x + 6 = 0"
+    GOOD = "所以 x = 2 或 x = 3"
+    BAD = "所以 x = 4"
+
+    async def test_a_correct_answer_is_verified_without_a_revision(
+        self, tutor_llama: Factory, prompts: PromptLibrary
+    ) -> None:
+        engine = build_engine(tutor_llama(tokens=(self.GOOD,)), prompts)
+        events = await collect(engine, message=self.QUADRATIC)
+        done = next(event for event in events if isinstance(event, TutorDoneEvent))
+
+        assert isinstance(done.response, TutorResponse)
+        assert [type(event) for event in events] == [
+            TutorStartEvent,
+            TutorTokenEvent,
+            TutorDoneEvent,
+        ]
+        assert done.verification is not None
+        assert done.verification.status is VerificationStatus.VERIFIED
+        assert done.verification.attempts == 0
+        assert done.response.tools_used == ("evaluate_expression",)
+        assert done.response.confidence is Confidence.HIGH
+        assert done.response.warnings == ()
+
+    async def test_a_conflicting_answer_triggers_one_correction(
+        self, tutor_llama: Factory, prompts: PromptLibrary
+    ) -> None:
+        engine = build_engine(tutor_llama(answers=[(self.BAD,), (self.GOOD,)]), prompts)
+        events = await collect(engine, message=self.QUADRATIC)
+
+        assert [type(event) for event in events] == [
+            TutorStartEvent,
+            TutorTokenEvent,
+            TutorRevisionEvent,
+            TutorTokenEvent,
+            TutorDoneEvent,
+        ]
+        revision = next(event for event in events if isinstance(event, TutorRevisionEvent))
+        assert revision.attempt == 1
+        assert "x = 4" in revision.detail
+
+        done = next(event for event in events if isinstance(event, TutorDoneEvent))
+        assert done.response.answer == self.GOOD  # the corrected pass is the final answer
+        assert done.verification is not None
+        assert done.verification.status is VerificationStatus.VERIFIED
+        assert done.verification.attempts == 1
+        assert done.response.warnings == ()
+        assert done.response.confidence is Confidence.HIGH
+
+    async def test_the_recheck_prompt_carries_the_conflict(
+        self, tutor_llama: Factory, prompts: PromptLibrary
+    ) -> None:
+        payloads: list[dict[str, Any]] = []
+        engine = build_engine(
+            tutor_llama(answers=[(self.BAD,), (self.GOOD,)], capture=payloads), prompts
+        )
+        await collect(engine, message=self.QUADRATIC)
+
+        streams = [payload for payload in payloads if payload.get("stream")]
+        assert len(streams) == 2
+        recheck = streams[1]["messages"]
+        assert [message["role"] for message in recheck] == [
+            "system",
+            "user",
+            "assistant",
+            "user",
+        ]
+        assert recheck[-2]["content"] == self.BAD  # the model sees its own answer
+        assert prompts.get("verify.md") in recheck[-1]["content"]
+        assert "x = 4" in recheck[-1]["content"]
+
+    async def test_a_persistent_conflict_stops_after_the_configured_attempts(
+        self, tutor_llama: Factory, prompts: PromptLibrary
+    ) -> None:
+        attempts_allowed = 2
+        engine = build_engine(tutor_llama(tokens=(self.BAD,)), prompts)
+        events = await collect(engine, message=self.QUADRATIC)
+        done = next(event for event in events if isinstance(event, TutorDoneEvent))
+
+        assert [type(event) for event in events].count(TutorRevisionEvent) == attempts_allowed
+        assert done.verification is not None
+        assert done.verification.status is VerificationStatus.CONFLICT
+        assert done.verification.attempts == attempts_allowed
+        # §7: a conflict is never hidden, and it costs confidence.
+        assert done.response.confidence is Confidence.LOW
+        assert any("冲突" in warning for warning in done.response.warnings)
+
+    async def test_the_conflict_warning_names_the_failing_value(
+        self, tutor_llama: Factory, prompts: PromptLibrary
+    ) -> None:
+        engine = build_engine(tutor_llama(tokens=(self.BAD,)), prompts)
+        done = next(
+            event
+            for event in await collect(engine, message=self.QUADRATIC)
+            if isinstance(event, TutorDoneEvent)
+        )
+        assert any("x = 4" in warning for warning in done.response.warnings)
+
+    async def test_an_unverifiable_answer_says_so_and_downgrades_confidence(
+        self, tutor_llama: Factory, prompts: PromptLibrary
+    ) -> None:
+        engine = build_engine(
+            tutor_llama(tokens=(self.GOOD,)), prompts, verifier=failing_verifier()
+        )
+        done = next(
+            event
+            for event in await collect(engine, message=self.QUADRATIC)
+            if isinstance(event, TutorDoneEvent)
+        )
+        assert done.verification is not None
+        assert done.verification.status is VerificationStatus.UNVERIFIABLE
+        assert UNVERIFIABLE_WARNING in done.response.warnings
+        assert done.response.confidence is Confidence.LOW
+
+    async def test_an_answer_with_nothing_to_check_is_left_alone(
+        self, tutor_llama: Factory, prompts: PromptLibrary
+    ) -> None:
+        engine = build_engine(tutor_llama(tokens=("因为等式两边同时加减同一个数。",)), prompts)
+        done = next(
+            event
+            for event in await collect(engine, message="为什么移项之后符号变了？")
+            if isinstance(event, TutorDoneEvent)
+        )
+        assert done.verification is not None
+        assert done.verification.status is VerificationStatus.NOTHING_TO_VERIFY
+        assert done.response.warnings == ()
+        assert done.response.confidence is Confidence.HIGH
+        assert done.response.tools_used == ()
+
+    async def test_non_maths_subjects_are_not_sympy_verified(
+        self, tutor_llama: Factory, prompts: PromptLibrary
+    ) -> None:
+        classification = json.dumps(
+            {"subject": "english", "grade": 9, "topic": None, "uncertain": False}
+        )
+        engine = build_engine(tutor_llama(classification=classification), prompts)
+        done = next(
+            event
+            for event in await collect(engine, message=self.QUADRATIC)
+            if isinstance(event, TutorDoneEvent)
+        )
+        assert done.verification is not None
+        assert done.verification.status is VerificationStatus.NOTHING_TO_VERIFY
+        assert done.verification.detail is not None
+        assert "非数学科目" in done.verification.detail
+
+    async def test_token_accounting_covers_every_pass(
+        self, tutor_llama: Factory, prompts: PromptLibrary
+    ) -> None:
+        engine = build_engine(
+            tutor_llama(answers=[(self.BAD,), (self.GOOD,)], prompt_tokens=10, completion_tokens=5),
+            prompts,
+        )
+        done = next(
+            event
+            for event in await collect(engine, message=self.QUADRATIC)
+            if isinstance(event, TutorDoneEvent)
+        )
+        assert done.prompt_tokens == 20  # two passes, both counted for the log (§18)
+        assert done.completion_tokens == 10
+
+
+class TestStudentPreCheck:
+    """§22 B/E: in check mode the student's own work goes through the tools first."""
+
+    STUDENT_WORK = "题目是 x^2 - 5*x + 6 = 0，我的过程是 (x-2)(x-3)，所以 x = 2，5，对了吗？"
+
+    async def test_the_tool_verdict_reaches_the_model(
+        self, tutor_llama: Factory, prompts: PromptLibrary
+    ) -> None:
+        payloads: list[dict[str, Any]] = []
+        engine = build_engine(tutor_llama(capture=payloads), prompts)
+        await collect(engine, message=self.STUDENT_WORK, mode=TutorMode.CHECK)
+
+        system = next(payload for payload in payloads if payload.get("stream"))["messages"][0]
+        assert "工具校验（SymPy）" in system["content"]
+        assert "x = 5" in system["content"]
+
+    async def test_the_verdict_is_reported_on_the_done_event(
+        self, tutor_llama: Factory, prompts: PromptLibrary
+    ) -> None:
+        engine = build_engine(tutor_llama(), prompts)
+        done = next(
+            event
+            for event in await collect(engine, message=self.STUDENT_WORK, mode=TutorMode.CHECK)
+            if isinstance(event, TutorDoneEvent)
+        )
+        assert done.verification is not None
+        assert done.verification.student_status is VerificationStatus.CONFLICT
+        assert done.verification.student_detail is not None
+        assert "x = 5" in done.verification.student_detail
+        assert done.response.tools_used == ("evaluate_expression",)
+
+    async def test_a_correct_student_answer_is_confirmed_by_the_tools(
+        self, tutor_llama: Factory, prompts: PromptLibrary
+    ) -> None:
+        payloads: list[dict[str, Any]] = []
+        engine = build_engine(tutor_llama(capture=payloads), prompts)
+        await collect(
+            engine,
+            message="题目是 x^2 - 5*x + 6 = 0，我的过程 (x-2)(x-3)，所以 x = 2，3",
+            mode=TutorMode.CHECK,
+        )
+        system = next(payload for payload in payloads if payload.get("stream"))["messages"][0]
+        assert "均成立" in system["content"]
+
+    async def test_tutor_mode_does_not_pre_check_the_student(
+        self, tutor_llama: Factory, prompts: PromptLibrary
+    ) -> None:
+        payloads: list[dict[str, Any]] = []
+        engine = build_engine(tutor_llama(capture=payloads), prompts)
+        await collect(engine, message=self.STUDENT_WORK, mode=TutorMode.TUTOR)
+        system = next(payload for payload in payloads if payload.get("stream"))["messages"][0]
+        assert "工具校验" not in system["content"]
 
 
 class TestPromptAssembly:

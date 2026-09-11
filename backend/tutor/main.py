@@ -53,7 +53,7 @@ def create_app(
             if llama_client is None:
                 await client.aclose()
 
-    app = FastAPI(title="Local Tutor", version="0.0.5", lifespan=lifespan)
+    app = FastAPI(title="Local Tutor", version="0.0.6", lifespan=lifespan)
     app.state.config = resolved
     app.state.llama = client
     app.state.prompts = library

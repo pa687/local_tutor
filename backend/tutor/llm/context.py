@@ -9,10 +9,11 @@
 4 Recent conversation <- caller-supplied history, trimmed to memory.recent_turns
 ```
 
-Layer 1 is followed by the answer-framing prompt (``prompts/solve.md``) and then by
-the policy layer's own block, so the most specific instruction is also the last one
-the model reads. Layers 2 and 3 are deliberately absent until their phases exist:
-this module never fabricates a profile or a "memory" it does not have.
+Layers 1 is followed by the answer-framing prompt (``prompts/solve.md``), the policy
+layer's own block, and — when the tools produced a verdict about the student's work —
+the verification block (``§22`` B/E). The most specific instruction is therefore also
+the last one the model reads. Layers 2 and 3 are deliberately absent until their
+phases exist: this module never fabricates a profile or a "memory" it does not have.
 
 Why the three top blocks become **one** system message
 ------------------------------------------------------
@@ -54,11 +55,14 @@ class ContextBuilder:
         message: str,
         policy_block: str,
         history: Sequence[ChatMessage] = (),
+        verification_block: str = "",
     ) -> list[ChatMessage]:
         """Assemble the message list for one turn.
 
         ``history`` must not contain the current ``message``: the caller (Phase 8's
-        conversation memory) owns that split.
+        conversation memory) owns that split. ``verification_block`` carries the
+        factual tool verdict for the student's own work (§22 B/E) and is empty when
+        there is no evidence to report.
         """
         layers = [
             self._prompts.get(SYSTEM_PROMPT),
@@ -66,6 +70,8 @@ class ContextBuilder:
         ]
         if policy_block.strip():
             layers.append(policy_block)
+        if verification_block.strip():
+            layers.append(verification_block)
         messages = [ChatMessage(role="system", content=LAYER_SEPARATOR.join(layers))]
         messages.extend(history[-self._config.recent_turns :])
         messages.append(ChatMessage(role="user", content=message))

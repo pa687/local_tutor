@@ -16,7 +16,7 @@ Nothing here talks to the model or to the network.
 from __future__ import annotations
 
 from enum import StrEnum
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -63,6 +63,59 @@ class Subject(StrEnum):
     UNKNOWN = "unknown"
 
 
+class VerificationStatus(StrEnum):
+    """Outcome of checking an answer's solution claims with the maths tools (§7)."""
+
+    VERIFIED = "verified"
+    CONFLICT = "conflict"
+    UNVERIFIABLE = "unverifiable"
+    NOTHING_TO_VERIFY = "nothing_to_verify"
+
+
+class VerificationClaim(BaseModel):
+    """A claim the verifier pulled out of an answer or out of the student's work."""
+
+    model_config = ConfigDict(frozen=True)
+
+    kind: str
+    variable: str
+    values: tuple[str, ...] = ()
+    snippet: str = ""
+    source: str = "answer"
+
+
+class VerificationCheck(BaseModel):
+    """One tool verdict: what a claimed value produced when substituted back."""
+
+    model_config = ConfigDict(frozen=True)
+
+    variable: str
+    value: str
+    residual: str
+    satisfied: bool
+
+
+class VerificationSummary(BaseModel):
+    """What §7's verification loop found, shaped for the API and the UI (§17).
+
+    ``tools`` is the raw audit trail (``ToolResult.as_event()`` entries) so a client can
+    render every call that really happened — including the failing ones. Nothing here
+    is inferred: if a tool was not called, it does not appear.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    status: VerificationStatus
+    source: str = "answer"
+    attempts: int = Field(default=0, ge=0)
+    detail: str | None = None
+    claims: tuple[VerificationClaim, ...] = ()
+    checks: tuple[VerificationCheck, ...] = ()
+    tools: tuple[dict[str, Any], ...] = ()
+    student_status: VerificationStatus | None = None
+    student_detail: str | None = None
+
+
 class TutorResponse(BaseModel):
     """One structured tutor answer (§6).
 
@@ -82,11 +135,25 @@ class TutorResponse(BaseModel):
     mode: TutorMode
 
     def with_answer(
-        self, answer: str, *, confidence: Confidence, warnings: tuple[str, ...]
+        self,
+        answer: str,
+        *,
+        confidence: Confidence,
+        warnings: tuple[str, ...],
+        tools_used: tuple[str, ...] | None = None,
     ) -> TutorResponse:
         """Rebuild the response once the whole answer is known."""
+        if tools_used is None:
+            return self.model_copy(
+                update={"answer": answer, "confidence": confidence, "warnings": warnings}
+            )
         return self.model_copy(
-            update={"answer": answer, "confidence": confidence, "warnings": warnings}
+            update={
+                "answer": answer,
+                "confidence": confidence,
+                "warnings": warnings,
+                "tools_used": tools_used,
+            }
         )
 
 
@@ -108,6 +175,19 @@ class TutorTokenEvent(BaseModel):
     text: str
 
 
+class TutorRevisionEvent(BaseModel):
+    """Announces a corrected answer: a previous pass conflicted with the tools (§7).
+
+    A client must discard the text it has streamed so far and start a new buffer.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    kind: Literal["revision"] = "revision"
+    attempt: int = Field(ge=1)
+    detail: str = ""
+
+
 class TutorDoneEvent(BaseModel):
     """Emitted after the answer is complete, carrying the final structure.
 
@@ -121,6 +201,7 @@ class TutorDoneEvent(BaseModel):
     response: TutorResponse
     prompt_tokens: int | None = None
     completion_tokens: int | None = None
+    verification: VerificationSummary | None = None
 
 
-TutorEvent = TutorStartEvent | TutorTokenEvent | TutorDoneEvent
+TutorEvent = TutorStartEvent | TutorTokenEvent | TutorRevisionEvent | TutorDoneEvent

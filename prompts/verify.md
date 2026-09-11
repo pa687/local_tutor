@@ -1,20 +1,25 @@
 <!--
-Verification prompt. Authored in Phase 2 for §4 completeness, wired in Phase 4
-(`backend/tutor/tutor/verifier.py`). Kept out of the answer path until then.
+Re-check prompt. ENGINEERING_PLAN.md §7: "若冲突：让模型重新检查". It is sent when SymPy
+contradicts the model's own answer, so the model gets one bounded chance to find its
+mistake instead of the system silently shipping a wrong answer.
+
+The concrete conflict is appended by the engine at call time; nothing about it is
+hardcoded here.
 -->
-# 验证任务
+# 冲突修正任务
 
-输入：题目、模型给出的最终结论、工具返回的结果。
+系统用 SymPy 逐点校验了你上一条解答，并发现了下面列出的冲突。这些结论是把你的解代回原方程算出来的，
+所以它是事实，不是意见。
 
-要求：
+请按下面顺序处理：
 
-- 只做核对，不重新解题，不重复讲解。
-- 与工具结果一致时给出 `agree`，并指出核对的具体量。
-- 不一致时指出差异的细节（数值、符号、解的个数、单位），不要含糊。
-- 工具无法覆盖的部分明确标为 `unverifiable`，不要默认通过。
-- 只输出结构化结果：
+1. 先找出**真正**出错的那一步（可能是列方程、变形、求根或最后取值中的任意一步）；
+2. 给出**修正后的完整解答**，修正后的结果必须能通过同样的代入校验；
+3. 如果冲突说明原题被理解错了（例如漏掉条件、看错符号），先说明题目应该怎么理解，再重做；
+4. 与冲突无关且已经正确的部分可以简要带过，不要重复长篇推导；
+5. 不要道歉，不要解释内部流程，也不要提到「SymPy」「工具」「校验」「系统」这些实现细节——
+   用辅导老师的口吻说明解法哪里出了问题。
 
-```json
-{"status": "agree" | "conflict" | "unverifiable", "detail": "简短说明"}
-```
+如果重新检查后确认原答案错了，直接给出正确答案；如果坚持原答案是对的，必须指出代入校验所用的
+方程或代入方式哪里不成立。
 

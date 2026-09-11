@@ -8,7 +8,19 @@
 
 ## 当前状态
 
-**Phase 3 — 受限数学工具系统**（已完成）：
+**Phase 4 — 数学可靠性闭环**（已完成）：
+
+- 答案生成后由 **SymPy 校验**：抽取解语句（`x = 2 或 x = 3`、`x₁ = 3/2`、`x = 1 ± √2`）→ 代入题目方程 → 判定；
+- 冲突则**让模型重检**（`prompts/verify.md`），最多 `tutor.max_verification_attempts` 次，重检结果再次校验，
+  修正后的解答通过 SSE `revision` 事件下发；冲突与「无法验证」一律转成 `warnings` + `confidence=low`，**不隐藏**；
+- `check` 模式**先校验学生自己给出的解**，把工具结论作为独立 context 层交给模型（§22 B/E：
+  指出最早出错的步骤，而不是重新长篇解题）；
+- 每次校验的真实工具调用（含失败的）随 `done.verification.tools` 下发，可直接展开成 §17 的 tool trace；
+  §18 的 `verification_status` 与 `tools_used` 日志字段开始有值；
+- 判据是 SymPy 而非第二个模型（自我评判有可能认同自己的错误）；
+- 验收记录、6 个真实环境问题与已知限制见 [`docs/phase4_verification.md`](docs/phase4_verification.md)。
+
+**Phase 3 — 受限数学工具系统**：
 
 - §7 的 **8 个工具**全部可用：`calculator`、`evaluate_expression`、`solve_equation`、
   `simplify_expression`、`factor_expression`、`differentiate`、`integrate`、`check_equivalence`；
@@ -16,21 +28,19 @@
   `unknown_tool` / `invalid_arguments` / `rejected` / `unsupported` / `timeout` / `internal`；
 - 表达式必须穿过 `tools/sandbox.py` 的四道闸门（尺寸、AST 白名单、标识符策略、幂量级）；
   禁止 `eval`/`exec`/`subprocess`/执行模型生成的 Python（§23.7，全仓 AST 守卫生效）；
-- 每次调用都有 trace（`ToolResult.as_event()` / `ToolTrace.tools_used`），供后续 UI 展示；
-- 逐条验收、恶意输入实测与设计约定见 [`docs/phase3_verification.md`](docs/phase3_verification.md)。
+- 验收记录见 [`docs/phase3_verification.md`](docs/phase3_verification.md)。
 
 **Phase 2 — 最小 Tutor Engine + 完整 Tutor Policy Layer**：
 
 - `/api/chat` 不再直接调用 `LlamaClient`，也不再拼 prompt；统一走
   `TutorEngine → Classifier → TutorPolicy → ContextBuilder → LlamaClient`（§6、§12）；
-- 三个模式 `tutor` / `explain` / `check` 都返回结构化响应（`subject`、`estimated_grade`、
-  `topic`、`confidence`、`tools_used`、`warnings`）；
-- prompt 全部从 `prompts/*.md` 读取（§13），改 prompt 不需要改 Python；
+- 三个模式 `tutor` / `explain` / `check` 都返回结构化响应；prompt 全部从 `prompts/*.md` 读取（§13）；
 - `policy.py` 为完整实现：五条 Tutor 规则 + 年级约束，均**不**写在 system prompt 里；
 - 验收记录见 [`docs/phase2_verification.md`](docs/phase2_verification.md)。
 
-**工具尚未接入请求路径**：`/api/chat` 目前不会调用任何工具（§7 的「解题 → 抽取 claim → 工具校验 →
-冲突重检」是 Phase 4），因此 `tools_used` 仍为空，`verification_status` 日志字段仍为 null。
+**校验覆盖面仍是保守的**：只校验「单未知量 + 闭式解」；应用题、含参讨论、方程组归为
+`nothing_to_verify`（不降级、不误报）。多模态（Phase 6）、学生档案（Phase 7）、对话记忆（Phase 8）、
+RAG（Phase 9）尚未开始。
 
 ## 环境
 
@@ -82,18 +92,44 @@ BENCH_CONTEXTS="65536 98304 131072" scripts/benchmark_model.sh   # 结果追加�
 响应 `text/event-stream`，事件序列：
 
 ```text
-event: start   data: {"request_id", "model", "mode", "subject", "estimated_grade",
-                      "topic", "confidence", "tools_used", "warnings"}
-event: token   data: {"text": "…"}
-event: done    data: {"request_id", "prompt_tokens", "completion_tokens", "latency_ms",
-                      "mode", "subject", "estimated_grade", "topic", "confidence",
-                      "tools_used", "warnings"}
-event: error   data: {"error", "detail"}      # 流已开始后模型侧失败时
+event: start    data: {"request_id", "model", "mode", "subject", "estimated_grade",
+                       "topic", "confidence", "tools_used", "warnings"}
+event: token    data: {"text": "…"}
+event: revision data: {"attempt": 1, "detail": "…"}   # 工具校验发现冲突：丢弃已接收文本，重新累积
+event: token    data: {"text": "…"}                   # 修正后的完整解答
+event: done     data: {"request_id", "prompt_tokens", "completion_tokens", "latency_ms",
+                       "mode", "subject", "estimated_grade", "topic", "confidence",
+                       "tools_used", "warnings", "verification"}
+event: error    data: {"error", "detail"}             # 流已开始后模型侧失败时
 ```
 
-`start` 与 `done` 的 metadata 形状相同：`start` 在首个 token 前给出（`confidence` 为分类阶段的基线值），
-`done` 在答案写完后给出（`confidence` 已计入策略检查，`warnings` 可能新增）。
+`start` 与 `done` 的 metadata 形状相同：`start` 在首个 token 前给出（`confidence` 为分类阶段的基线值；
+`check` 模式下 `tools_used` 可能已包含校验学生作业用到的工具），`done` 在答案写完后给出
+（`confidence` 已计入策略检查与工具校验，`warnings` 可能新增）。
 **`answer` 不在 `done` 里重复出现** —— 客户端已经从 `token` 事件拿到全文。
+
+`done.verification`（§7 的校验结论，`null` 表示该科目不做校验）：
+
+```json
+{
+  "status": "verified | conflict | unverifiable | nothing_to_verify",
+  "source": "answer",
+  "attempts": 0,
+  "detail": "x = 2、x = 3 代入原方程均成立",
+  "claims":  [{"kind": "solution_set", "variable": "x", "values": ["2", "3"], "snippet": "x = 2, 3", "source": "answer"}],
+  "checks":  [{"variable": "x", "value": "2", "residual": "0", "satisfied": true}],
+  "tools":   [{"tool": "evaluate_expression", "arguments": {"…": "…"}, "ok": true, "output": {"…": "…"},
+               "error": null, "error_kind": null, "duration_ms": 1.2}],
+  "student_status": "verified | conflict | … | null",
+  "student_detail": "x = -3 代入后方程两边的差为 30"
+}
+```
+
+- `tools` 是**真实发生过**的调用（含失败的），可直接渲染成 §17 的 tool trace；
+  没调用过就一定是空数组，不会出现「声称调用」。
+- `status="conflict"` 时 `warnings` 必含冲突详情、`confidence` 为 `low`；`unverifiable` 时
+  `warnings` 含「结果未能通过自动验证」；`nothing_to_verify`（无解语句 / 无参照方程 / 非数学科目）不降级。
+- `student_status` 仅在 `check` 模式下有意义。
 
 首批 token 之前就失败的情况用 HTTP 状态码表达（无需解析流）：
 
@@ -147,7 +183,7 @@ LOCAL_TUTOR__LLM__MODEL=qwen3.6-27b uv run uvicorn tutor.main:app
 prompts/tutor_system.md      # 短而硬的 system prompt（§13 的原则）
 prompts/solve.md             # 各模式共用的作答要求
 prompts/classify.md          # 题目结构化（subject / grade / topic / uncertain）
-prompts/verify.md            # Phase 4 接线
+prompts/verify.md            # 工具校验发现冲突后的「重检」指令（Phase 4 接线）
 prompts/summarize_student.md # Phase 8 接线
 ```
 
@@ -226,7 +262,7 @@ local-tutor/
 ├── frontend/            # P11
 ├── prompts/             # P2：tutor_system / solve / classify / verify / summarize_student
 ├── eval/                # datasets/ runner.py graders.py reports/ (P5)
-├── docs/                # 实测记录：llama_benchmarks.md、phase1/2/3_verification.md
+├── docs/                # 实测记录：llama_benchmarks.md、phase1/2/3/4_verification.md
 ├── scripts/             # start_llama.sh benchmark_model.sh (P1) bench_llama.py smoke_test.sh (P5)
 └── tests/
 ```
