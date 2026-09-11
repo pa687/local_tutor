@@ -26,7 +26,7 @@ from tutor.logging_config import (
 def create_app(config: AppConfig | None = None) -> FastAPI:
     """Build the FastAPI application. ``config`` overrides the process configuration."""
     setup_logging()
-    app = FastAPI(title="Local Tutor", version="0.1.0")
+    app = FastAPI(title="Local Tutor", version="0.0.1")
     app.state.config = config if config is not None else get_config()
 
     @app.middleware("http")

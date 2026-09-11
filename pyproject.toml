@@ -1,6 +1,6 @@
 [project]
 name = "local-tutor"
-version = "0.1.0"
+version = "0.0.1"
 description = "Fully local AI tutor for middle/high-school students (FastAPI + llama.cpp)"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
