@@ -7,7 +7,9 @@ These tests make the layout DoD executable:
   into an earlier phase);
 * the §23.7 red line holds — no ``eval`` / ``exec`` / ``subprocess`` anywhere in the
   backend or the test suite (dev scripts under ``scripts/`` are exempt: they only
-  call nvidia-smi).
+  call nvidia-smi);
+* the §7 tool package imports maths and nothing else.
+* the §7 tool package imports maths and nothing else.
 """
 
 from __future__ import annotations
@@ -40,6 +42,7 @@ EXPECTED_PATHS = [
     "backend/tutor/tutor/verifier.py",
     "backend/tutor/tutor/response.py",
     "backend/tutor/tools/registry.py",
+    "backend/tutor/tools/sandbox.py",
     "backend/tutor/tools/calculator.py",
     "backend/tutor/tools/algebra.py",
     "backend/tutor/tools/units.py",
@@ -91,15 +94,52 @@ def placeholder_modules() -> list[Path]:
 
 
 def test_placeholders_exist_for_later_phases() -> None:
-    # Phase 2 turned six of them (policy, engine, response, classifier, prompts,
-    # context) into real modules; the remaining ones belong to Phases 3–9.
-    assert len(placeholder_modules()) >= 15
+    # Phase 2 turned six of them into real modules, Phase 3 three more (registry,
+    # calculator, algebra plus the new sandbox); the rest belong to Phases 4–9.
+    assert len(placeholder_modules()) >= 12
 
 
 @pytest.mark.parametrize("script", ["start_llama.sh", "benchmark_model.sh", "smoke_test.sh"])
 def test_shell_scripts_are_executable(script: str) -> None:
     path = REPO_ROOT / "scripts" / script
     assert path.stat().st_mode & 0o111, f"{script} is not executable"
+
+
+#: Modules a tool implementation may import. §7 allows structured maths and nothing
+#: else: no shell, no network, no filesystem, no dynamic execution.
+TOOL_ALLOWED_IMPORTS = {
+    "__future__",
+    "ast",
+    "collections",
+    "concurrent",
+    "dataclasses",
+    "enum",
+    "logging",
+    "math",
+    "pydantic",
+    "re",
+    "sympy",
+    "time",
+    "typing",
+}
+
+
+def test_tool_modules_import_nothing_dangerous() -> None:
+    """§7: the tool package does maths through SymPy and reaches for nothing else."""
+    offenders: list[str] = []
+    for path in sorted((BACKEND / "tools").glob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                roots = [alias.name.split(".")[0] for alias in node.names]
+            elif isinstance(node, ast.ImportFrom):
+                roots = [(node.module or "").split(".")[0]]
+            else:
+                continue
+            for root in roots:
+                if root and root not in TOOL_ALLOWED_IMPORTS and root != "tutor":
+                    offenders.append(f"{path.name}:{root}")
+    assert offenders == []
 
 
 def test_placeholder_modules_contain_no_logic() -> None:

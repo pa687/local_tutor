@@ -15,6 +15,7 @@ from tutor.config import AppConfig, LLMConfig, load_config, reset_config_cache
 from tutor.llm.client import LlamaClient
 from tutor.llm.prompts import PromptLibrary
 from tutor.main import create_app
+from tutor.tools.registry import ToolRegistry, build_default_registry
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TEST_BASE_URL = "http://llama.test"
@@ -64,6 +65,12 @@ def repo_root() -> Path:
 def prompts() -> PromptLibrary:
     """The repository's real prompt files (§13)."""
     return PromptLibrary(REPO_ROOT / "prompts")
+
+
+@pytest.fixture(scope="session")
+def tools() -> ToolRegistry:
+    """The default registry holding exactly the eight §7 tools."""
+    return build_default_registry()
 
 
 @pytest.fixture

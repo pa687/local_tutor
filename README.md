@@ -8,7 +8,18 @@
 
 ## 当前状态
 
-**Phase 2 — 最小 Tutor Engine + 完整 Tutor Policy Layer**（已完成）：
+**Phase 3 — 受限数学工具系统**（已完成）：
+
+- §7 的 **8 个工具**全部可用：`calculator`、`evaluate_expression`、`solve_equation`、
+  `simplify_expression`、`factor_expression`、`differentiate`、`integrate`、`check_equivalence`；
+- 参数由 Pydantic 严格校验（`extra="forbid"`）；调用/返回使用 §7 的结构化信封，错误统一为
+  `unknown_tool` / `invalid_arguments` / `rejected` / `unsupported` / `timeout` / `internal`；
+- 表达式必须穿过 `tools/sandbox.py` 的四道闸门（尺寸、AST 白名单、标识符策略、幂量级）；
+  禁止 `eval`/`exec`/`subprocess`/执行模型生成的 Python（§23.7，全仓 AST 守卫生效）；
+- 每次调用都有 trace（`ToolResult.as_event()` / `ToolTrace.tools_used`），供后续 UI 展示；
+- 逐条验收、恶意输入实测与设计约定见 [`docs/phase3_verification.md`](docs/phase3_verification.md)。
+
+**Phase 2 — 最小 Tutor Engine + 完整 Tutor Policy Layer**：
 
 - `/api/chat` 不再直接调用 `LlamaClient`，也不再拼 prompt；统一走
   `TutorEngine → Classifier → TutorPolicy → ContextBuilder → LlamaClient`（§6、§12）；
@@ -16,9 +27,10 @@
   `topic`、`confidence`、`tools_used`、`warnings`）；
 - prompt 全部从 `prompts/*.md` 读取（§13），改 prompt 不需要改 Python；
 - `policy.py` 为完整实现：五条 Tutor 规则 + 年级约束，均**不**写在 system prompt 里；
-- 逐条验收与真实模型记录见 [`docs/phase2_verification.md`](docs/phase2_verification.md)。
+- 验收记录见 [`docs/phase2_verification.md`](docs/phase2_verification.md)。
 
-**仍无工具 / 数据库 / RAG**：`tools_used` 恒为空，`verification_status` 日志字段仍为 null（Phase 3/4 填）。
+**工具尚未接入请求路径**：`/api/chat` 目前不会调用任何工具（§7 的「解题 → 抽取 claim → 工具校验 →
+冲突重检」是 Phase 4），因此 `tools_used` 仍为空，`verification_status` 日志字段仍为 null。
 
 ## 环境
 
@@ -145,6 +157,45 @@ prompts/summarize_student.md # Phase 8 接线
 - Qwen3.5 的 chat template 要求 system message 必须在最前，因此三层（system / 作答要求 / policy）
   会拼成**一条** system message 发送，逻辑分层不变。
 
+## 工具系统（§7）
+
+受限的数学工具，全部基于 SymPy，**不允许**任何形式的代码执行。
+
+| 工具 | 参数 | 返回 |
+|---|---|---|
+| `calculator` | `expression`, `precision=10` | `result`, `decimal`（精确值 + 十进制） |
+| `evaluate_expression` | `expression`, `substitutions`, `precision=10` | `expression`, `result`, `decimal` |
+| `solve_equation` | `equation`, `variable="x"` | `variable`, `solutions`, `count`（无解时附 `note`） |
+| `simplify_expression` | `expression` | `simplified` |
+| `factor_expression` | `expression` | `factored` |
+| `differentiate` | `expression`, `variable="x"`, `order=1` | `variable`, `order`, `derivative` |
+| `integrate` | `expression`, `variable="x"`, `lower`, `upper` | `antiderivative` + `constant`，或定积分 `value` |
+| `check_equivalence` | `expression_a`, `expression_b` | `equivalent`, `difference` |
+
+调用使用 §7 的结构化信封（Phase 4 负责把模型输出解析成它）：
+
+```json
+{"tool": "solve_equation", "arguments": {"equation": "x**2 - 5*x + 6", "variable": "x"}}
+```
+
+```python
+from tutor.tools.registry import build_default_registry
+
+registry = build_default_registry()
+result = registry.call_request({"tool": "solve_equation",
+                                "arguments": {"equation": "x^2 - 5*x + 6 = 0"}})
+result.ok            # True
+result.output        # {'variable': 'x', 'solutions': ['2', '3'], 'count': 2}
+result.summary()     # ✓ solve_equation(…) → variable=x, solutions=['2', '3'], count=2
+```
+
+- **永不抛异常**：坏参数、坏信封、超时都变成带类型的 `ToolResult`（`error_kind` + `error`）。
+- **表达式沙箱**（`tools/sandbox.py`）：长度/节点数上限 → AST 白名单 → 标识符策略 → 幂量级保护，
+  四道闸门全部先于 SymPy；`^` 会被规范化为 `**`（SymPy 自身把 `^` 当异或，`2^64` → `66`）。
+- **超时**默认 5 s（`ToolRegistry(default_timeout=...)` 可注入）；SymPy 无法取消，
+  超时只约束「等待」，硬终止需要进程池（已知限制，见 `docs/phase3_verification.md` §6）。
+- **可审计**：`ToolTrace.tools_used`（只含成功调用）/ `.failures` / `.as_events()`。
+
 ## 日志（§18）
 
 - 每个请求生成 `request_id`，响应头回显 `X-Request-Id`。
@@ -168,14 +219,14 @@ local-tutor/
 │   ├── api/             # chat.py(P2/P6) students.py(P7) health.py(P0)
 │   ├── llm/             # client.py(P1) models.py(P1) prompts.py(P2) context.py(P2)
 │   ├── tutor/           # engine.py(P2) policy.py(P2) classifier.py(P2) verifier.py(P4) response.py(P2)
-│   ├── tools/           # registry.py calculator.py algebra.py (P3) units.py (reserved)
+│   ├── tools/           # registry.py sandbox.py calculator.py algebra.py(P3) units.py(reserved)
 │   ├── memory/          # student.py(P7) conversation.py(P8) summarizer.py(P8)
 │   ├── retrieval/       # ingest.py chunk.py search.py models.py (P9)
 │   └── db/              # models.py session.py (P7)
 ├── frontend/            # P11
 ├── prompts/             # P2：tutor_system / solve / classify / verify / summarize_student
 ├── eval/                # datasets/ runner.py graders.py reports/ (P5)
-├── docs/                # 实测记录：llama_benchmarks.md、phase1_verification.md、phase2_verification.md
+├── docs/                # 实测记录：llama_benchmarks.md、phase1/2/3_verification.md
 ├── scripts/             # start_llama.sh benchmark_model.sh (P1) bench_llama.py smoke_test.sh (P5)
 └── tests/
 ```

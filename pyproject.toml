@@ -1,6 +1,6 @@
 [project]
 name = "local-tutor"
-version = "0.0.4"
+version = "0.0.5"
 description = "Fully local AI tutor for middle/high-school students (FastAPI + llama.cpp)"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
@@ -62,3 +62,10 @@ python_version = "3.12"
 files = ["backend/tutor", "tests"]
 mypy_path = "backend"
 strict = true
+
+# SymPy ships no type information (no py.typed, no stubs), and §23.6 forbids adding
+# dependencies just for typing — so its imports stay untyped and explicit ``str()``
+# conversions guard the boundaries that matter.
+[[tool.mypy.overrides]]
+module = ["sympy", "sympy.*"]
+ignore_missing_imports = true
