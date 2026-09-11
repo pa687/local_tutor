@@ -12,6 +12,11 @@ llm:
   base_url: http://127.0.0.1:8080
   model: qwen3.5-9b
   timeout: 180
+  # Hybrid-thinking models (Qwen3.5) spend 20+ s of invisible reasoning before the
+  # first visible token; measured 2026-09-11 on a grade-9 quadratic: thinking=false
+  # gave TTFT 0.19 s, thinking=true 23.2 s, with no quality gain for a hint. Set to
+  # true for hard problems — the classifier call never thinks, regardless.
+  enable_thinking: false
 
 tutor:
   default_mode: tutor

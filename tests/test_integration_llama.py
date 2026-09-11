@@ -24,7 +24,11 @@ import pytest
 from fastapi.testclient import TestClient
 
 from tutor.config import AppConfig, LLMConfig, get_config
+from tutor.llm.client import LlamaClient
+from tutor.llm.prompts import get_prompt_library
 from tutor.main import create_app
+from tutor.tutor.engine import ConversationRef, StudentRef, TutorEngine
+from tutor.tutor.response import Confidence, Subject, TutorMode, TutorResponse
 
 pytestmark = [
     pytest.mark.integration,
@@ -102,3 +106,69 @@ def test_unreachable_server_does_not_break_the_backend() -> None:
     with TestClient(create_app(config)) as client:
         assert client.post("/api/chat", json=CHAT_REQUEST).status_code == 503
         assert client.get("/health").json()["llama"] == "down"
+
+
+# --------------------------------------------------------------------- Phase 2
+
+
+MATH_MESSAGE = "解方程 x^2 - 5x + 6 = 0"
+MATH_REQUEST = {
+    "student_id": "integration-student",
+    "conversation_id": "integration-conversation",
+    "mode": "tutor",
+    "grade": 9,
+    "message": MATH_MESSAGE,
+}
+
+
+def test_chat_exposes_structured_metadata_against_a_live_model(
+    live_client: TestClient,
+) -> None:
+    """Phase 2 DoD: the three modes return a structured TutorResponse, for real."""
+    response = live_client.post("/api/chat", json=MATH_REQUEST)
+    assert response.status_code == 200
+
+    events = parse_events(response.text)
+    start = dict(events[0][1])
+    done = dict(events[-1][1])
+
+    assert start["mode"] == "tutor"
+    assert start["subject"] in {subject.value for subject in Subject}
+    assert start["confidence"] in {level.value for level in Confidence}
+    assert start["estimated_grade"] == 9
+    assert done["confidence"] in {level.value for level in Confidence}
+    assert isinstance(done["completion_tokens"], int)
+    assert done["completion_tokens"] > 0
+    # The classification call is real: a maths question must not come back unknown.
+    assert start["subject"] != Subject.UNKNOWN.value
+
+
+@pytest.mark.parametrize("mode", ["tutor", "explain", "check"])
+def test_every_mode_answers_against_a_live_model(live_client: TestClient, mode: str) -> None:
+    response = live_client.post("/api/chat", json={**MATH_REQUEST, "mode": mode})
+    assert response.status_code == 200
+    events = parse_events(response.text)
+    assert events[0][1]["mode"] == mode
+    assert [name for name, _ in events][-1] == "done"
+
+
+async def test_tutor_engine_responds_with_a_structured_response() -> None:
+    """The engine's §6 core interface, exercised without an HTTP layer."""
+    config = get_config()
+    client = LlamaClient(config.llm)
+    try:
+        engine = TutorEngine(client, get_prompt_library(), config)
+        response = await engine.respond(
+            StudentRef(id="integration-student", grade=9),
+            ConversationRef(id="integration-conversation"),
+            MATH_MESSAGE,
+            mode=TutorMode.TUTOR,
+        )
+    finally:
+        await client.aclose()
+
+    assert isinstance(response, TutorResponse)
+    assert response.answer.strip()
+    assert response.subject in set(Subject)
+    assert response.estimated_grade == 9
+    assert "只给第一步提示" not in response.warnings  # rules go to the model, not the client

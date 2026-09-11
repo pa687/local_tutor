@@ -54,6 +54,7 @@ EXPECTED_PATHS = [
     "backend/tutor/db/session.py",
     "prompts/tutor_system.md",
     "prompts/solve.md",
+    "prompts/classify.md",
     "prompts/verify.md",
     "prompts/summarize_student.md",
     "eval/runner.py",
@@ -90,7 +91,9 @@ def placeholder_modules() -> list[Path]:
 
 
 def test_placeholders_exist_for_later_phases() -> None:
-    assert len(placeholder_modules()) > 15
+    # Phase 2 turned six of them (policy, engine, response, classifier, prompts,
+    # context) into real modules; the remaining ones belong to Phases 3–9.
+    assert len(placeholder_modules()) >= 15
 
 
 @pytest.mark.parametrize("script", ["start_llama.sh", "benchmark_model.sh", "smoke_test.sh"])
@@ -147,3 +150,38 @@ def test_engineering_plan_is_the_finalised_plan(repo_root: Path) -> None:
     plan = (repo_root / "ENGINEERING_PLAN.md").read_text(encoding="utf-8")
     assert plan.startswith("# Local Tutor — 工程实施计划")
     assert "# 27. 项目成功标准" in plan
+
+
+def _docstring_nodes(tree: ast.Module) -> set[int]:
+    """Ids of the string constants that are docstrings, i.e. allowed to be long."""
+    owners = (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
+    ids: set[int] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, owners) or not node.body:
+            continue
+        first = node.body[0]
+        if (
+            isinstance(first, ast.Expr)
+            and isinstance(first.value, ast.Constant)
+            and isinstance(first.value.value, str)
+        ):
+            ids.add(id(first.value))
+    return ids
+
+
+def test_no_long_prompt_literals_in_python() -> None:
+    """§13: prompt text belongs in ``prompts/*.md``, not in a Python literal."""
+    limit = 400
+    offenders: list[str] = []
+    for path in python_modules():
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        allowed = _docstring_nodes(tree)
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Constant)
+                and isinstance(node.value, str)
+                and id(node) not in allowed
+                and len(node.value) > limit
+            ):
+                offenders.append(f"{path.relative_to(REPO_ROOT)}:{node.lineno}")
+    assert offenders == []

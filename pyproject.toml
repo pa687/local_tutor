@@ -1,6 +1,6 @@
 [project]
 name = "local-tutor"
-version = "0.0.3"
+version = "0.0.4"
 description = "Fully local AI tutor for middle/high-school students (FastAPI + llama.cpp)"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
@@ -41,6 +41,13 @@ markers = ["integration: requires a running llama-server (Phase 1+)"]
 line-length = 100
 target-version = "py312"
 src = ["backend", "tests"]
+
+# ruff >= 0.16 also reformats the Python snippets inside Markdown code blocks.
+# ENGINEERING_PLAN.md is the authoritative spec and must stay byte-identical to
+# temp.md, so Markdown is out of scope for the formatter (and only for it: lint
+# never reads .md).
+[tool.ruff.format]
+exclude = ["*.md"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "S"]

@@ -4,11 +4,13 @@ The real restart drill (stop llama-server, watch /health go ``down`` and ``/api/
 return 503, restart it, watch both recover without restarting the app) is recorded in
 ``docs/phase1_verification.md``. This test pins the property that makes it work: the
 client keeps no cached health or connection state, so the very next request after the
-outage goes through.
+outage goes through. Phase 2 made each chat request two calls (classify, then answer),
+so the stand-in server serves both shapes.
 """
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 
 import httpx
@@ -25,6 +27,9 @@ REQUEST = {
     "mode": "tutor",
     "message": "ping",
 }
+CLASSIFICATION = json.dumps(
+    {"subject": "math", "grade": 9, "topic": "quadratic_equations", "uncertain": False}
+)
 
 
 def build_flaky_transport() -> tuple[httpx.MockTransport, dict[str, bool]]:
@@ -38,6 +43,9 @@ def build_flaky_transport() -> tuple[httpx.MockTransport, dict[str, bool]]:
             return httpx.Response(200, json={"status": "ok"})
         if request.url.path == "/props":
             return httpx.Response(200, json={"model_alias": "qwen3.5-9b", "n_ctx": 65536})
+        payload = json.loads(request.content)
+        if not payload.get("stream"):
+            return httpx.Response(200, json={"choices": [{"message": {"content": CLASSIFICATION}}]})
         return httpx.Response(
             200,
             text=(

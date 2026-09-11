@@ -1,19 +1,28 @@
-"""``POST /api/chat`` — SSE streaming chat (ENGINEERING_PLAN.md §5, §16).
+"""``POST /api/chat`` — SSE streaming chat (ENGINEERING_PLAN.md §6, §16).
 
-Phase 1 sends the student's message straight to llama-server, so the transport is
-provable before any policy exists. Phase 2 replaces the message assembly below with
-the ``TutorEngine → Policy → ContextBuilder`` chain (§6); this module must not grow
-prompt or policy logic in the meantime.
+Phase 2 routes every turn through :class:`~tutor.tutor.engine.TutorEngine`, so this
+module owns only the transport: it validates the request, resolves the mode, maps
+engine events onto SSE, and maps engine failures onto HTTP status codes. It contains
+no prompt text, no policy rule and no direct model call — §6 forbids it and
+``tests/test_api_boundaries.py`` enforces it.
 
 SSE contract (also documented in README):
 
-    event: start   data: {"request_id", "model", "mode"}
+    event: start   data: {"request_id", "model", "mode", "subject", "estimated_grade",
+                          "topic", "confidence", "warnings"}
     event: token   data: {"text": "..."}
-    event: done    data: {"request_id", "prompt_tokens", "completion_tokens", "latency_ms"}
+    event: done    data: {"request_id", "prompt_tokens", "completion_tokens",
+                          "latency_ms", "mode", "subject", "estimated_grade", "topic",
+                          "confidence", "tools_used", "warnings"}
     event: error   data: {"error", "detail"}
 
-Failures before the first token are reported as HTTP status codes (503 / 504 / 502)
-so callers do not have to parse a stream to learn the backend is gone.
+``start`` and ``done`` carry the same metadata shape; ``start`` reports it before the
+first token (with the baseline confidence) and ``done`` after the answer has been
+inspected (with the final confidence and any policy warnings). ``answer`` is not
+repeated in ``done`` — the client already has it from the ``token`` events.
+
+Failures before the first token are reported as HTTP status codes (503 / 504 / 502 /
+422) so callers do not have to parse a stream to learn the request cannot be served.
 """
 
 from __future__ import annotations
@@ -21,7 +30,7 @@ from __future__ import annotations
 import json
 import logging
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request, status
@@ -30,25 +39,38 @@ from pydantic import BaseModel, Field
 
 from tutor.config import AppConfig
 from tutor.llm.client import (
-    LlamaClient,
     LlamaClientError,
     LlamaResponseError,
     LlamaTimeoutError,
     LlamaUnavailableError,
 )
-from tutor.llm.models import ChatMessage, StreamDelta
 from tutor.logging_config import RequestLogRecord, current_request_id, log_request
+from tutor.tutor.engine import ConversationRef, StudentRef, TutorEngine
+from tutor.tutor.response import (
+    InvalidTutorModeError,
+    TutorDoneEvent,
+    TutorEvent,
+    TutorMode,
+    TutorResponse,
+    TutorStartEvent,
+    TutorTokenEvent,
+)
 
 router = APIRouter(prefix="/api", tags=["chat"])
 logger = logging.getLogger(__name__)
 
 
 class ChatRequest(BaseModel):
-    """Request body of ``POST /api/chat`` (§16)."""
+    """Request body of ``POST /api/chat`` (§16).
+
+    ``grade`` is optional: Phase 2 takes it from the request, Phase 7 replaces it
+    with the student profile's grade. When absent, the classifier's estimate is used.
+    """
 
     student_id: str = Field(min_length=1)
     conversation_id: str = Field(min_length=1)
     mode: str | None = None
+    grade: int | None = Field(default=None, ge=1, le=12)
     message: str = Field(min_length=1)
 
 
@@ -56,11 +78,31 @@ def _sse(event: str, data: dict[str, Any]) -> str:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
-def _llama_client(request: Request) -> LlamaClient:
-    client: LlamaClient | None = getattr(request.app.state, "llama", None)
-    if client is None:  # pragma: no cover - create_app always installs one
-        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "llama client not initialised")
-    return client
+def _engine(request: Request) -> TutorEngine:
+    engine: TutorEngine | None = getattr(request.app.state, "engine", None)
+    if engine is None:  # pragma: no cover - create_app always installs one
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "tutor engine not initialised")
+    return engine
+
+
+def _resolve_mode(raw: str | None, config: AppConfig) -> TutorMode:
+    """Turn the request/config mode string into a :class:`TutorMode` (422 if unknown)."""
+    try:
+        return TutorMode.parse(raw if raw is not None else config.tutor.default_mode)
+    except InvalidTutorModeError as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, str(exc)) from exc
+
+
+def _metadata(response: TutorResponse) -> dict[str, Any]:
+    return {
+        "mode": response.mode.value,
+        "subject": response.subject.value,
+        "estimated_grade": response.estimated_grade,
+        "topic": response.topic,
+        "confidence": response.confidence.value,
+        "tools_used": list(response.tools_used),
+        "warnings": list(response.warnings),
+    }
 
 
 def _as_http_error(exc: LlamaClientError) -> HTTPException:
@@ -79,21 +121,25 @@ def _as_http_error(exc: LlamaClientError) -> HTTPException:
 async def chat(payload: ChatRequest, request: Request) -> StreamingResponse:
     """Stream an answer as SSE, one token event at a time."""
     config: AppConfig = request.app.state.config
-    client = _llama_client(request)
-    mode = payload.mode or config.tutor.default_mode
-    model = client.model
+    engine = _engine(request)
+    mode = _resolve_mode(payload.mode, config)
+    model = config.llm.model
     request_id = current_request_id() or "unknown"
 
-    # TODO(Phase 2): assemble messages through TutorEngine/Policy/ContextBuilder (§6).
-    messages = [ChatMessage(role="user", content=payload.message)]
-
-    stream = client.stream_chat(messages)
+    events = engine.stream(
+        StudentRef(id=payload.student_id, grade=payload.grade),
+        ConversationRef(id=payload.conversation_id),
+        payload.message,
+        mode=mode,
+    )
+    # Pull the first event eagerly: a dead backend or an unusable request must still
+    # be reportable as an HTTP status code, not as a half-open stream.
     try:
-        first: StreamDelta | None = await anext(stream)
-    except StopAsyncIteration:
+        first: TutorEvent | None = await anext(events)
+    except StopAsyncIteration:  # pragma: no cover - the engine always emits a start
         first = None
     except LlamaClientError as exc:
-        await stream.aclose()
+        await events.aclose()
         raise _as_http_error(exc) from exc
 
     started_at = time.perf_counter()
@@ -101,27 +147,35 @@ async def chat(payload: ChatRequest, request: Request) -> StreamingResponse:
     async def event_stream() -> AsyncIterator[str]:
         prompt_tokens: int | None = None
         completion_tokens: int | None = None
+        final: TutorResponse | None = None
         try:
-            yield _sse("start", {"request_id": request_id, "model": model, "mode": mode})
-            async for delta in _chain(first, stream):
-                prompt_tokens = delta.prompt_tokens or prompt_tokens
-                completion_tokens = delta.completion_tokens or completion_tokens
-                if delta.content:
-                    yield _sse("token", {"text": delta.content})
-            yield _sse(
-                "done",
-                {
-                    "request_id": request_id,
-                    "prompt_tokens": prompt_tokens,
-                    "completion_tokens": completion_tokens,
-                    "latency_ms": round((time.perf_counter() - started_at) * 1000, 3),
-                },
-            )
+            async for event in _chain(first, events):
+                if isinstance(event, TutorStartEvent):
+                    yield _sse(
+                        "start",
+                        {"request_id": request_id, "model": model, **_metadata(event.response)},
+                    )
+                elif isinstance(event, TutorTokenEvent):
+                    yield _sse("token", {"text": event.text})
+                elif isinstance(event, TutorDoneEvent):
+                    final = event.response
+                    prompt_tokens = event.prompt_tokens or prompt_tokens
+                    completion_tokens = event.completion_tokens or completion_tokens
+                    yield _sse(
+                        "done",
+                        {
+                            "request_id": request_id,
+                            "prompt_tokens": prompt_tokens,
+                            "completion_tokens": completion_tokens,
+                            "latency_ms": round((time.perf_counter() - started_at) * 1000, 3),
+                            **_metadata(final),
+                        },
+                    )
         except LlamaClientError as exc:
             logger.warning("chat stream aborted: %s", exc)
             yield _sse("error", {"error": type(exc).__name__, "detail": str(exc)})
         finally:
-            await stream.aclose()
+            await events.aclose()
             log_request(
                 RequestLogRecord(
                     request_id=request_id,
@@ -131,6 +185,7 @@ async def chat(payload: ChatRequest, request: Request) -> StreamingResponse:
                     prompt_tokens=prompt_tokens,
                     completion_tokens=completion_tokens,
                     latency_ms=round((time.perf_counter() - started_at) * 1000, 3),
+                    tools_used=final.tools_used if final is not None else (),
                 ),
                 event="chat.completed",
             )
@@ -139,11 +194,11 @@ async def chat(payload: ChatRequest, request: Request) -> StreamingResponse:
 
 
 async def _chain(
-    first: StreamDelta | None,
-    stream: AsyncIterator[StreamDelta],
-) -> AsyncIterator[StreamDelta]:
-    """Re-attach the delta pulled eagerly (for status codes) to the rest of the stream."""
+    first: TutorEvent | None,
+    events: AsyncGenerator[TutorEvent, None],
+) -> AsyncGenerator[TutorEvent, None]:
+    """Re-attach the event pulled eagerly (for status codes) to the rest of the stream."""
     if first is not None:
         yield first
-    async for delta in stream:
-        yield delta
+    async for event in events:
+        yield event

@@ -34,11 +34,16 @@ class SectionModel(BaseModel):
 
 
 class LLMConfig(SectionModel):
-    """llama-server endpoint settings."""
+    """llama-server endpoint settings, plus the generation defaults we send with it."""
 
     base_url: str = "http://127.0.0.1:8080"
     model: str = "qwen3.5-9b"
     timeout: float = Field(default=180.0, gt=0)
+    #: ``chat_template_kwargs.enable_thinking`` for the answer stream. Off by default:
+    #: a hybrid-thinking model otherwise stays silent for tens of seconds before the
+    #: first visible token (see ``config.yaml`` for the measurement). Inference
+    #: parameters belong here, never hardcoded in Python (§1.5).
+    enable_thinking: bool = False
 
 
 class TutorConfig(SectionModel):

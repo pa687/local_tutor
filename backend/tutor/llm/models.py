@@ -23,12 +23,19 @@ class ChatMessage(BaseModel):
 
 
 class GenerationOptions(BaseModel):
-    """Optional sampling parameters; unset values are left to llama-server defaults."""
+    """Optional sampling parameters; unset values are left to llama-server defaults.
+
+    ``enable_thinking`` is passed through as ``chat_template_kwargs`` and only sent
+    when set: Qwen-style templates honour it, other templates simply never see the
+    key. Internal calls that need a deterministic, short answer (the classifier) turn
+    it off; the answer itself leaves the model on its own default.
+    """
 
     model_config = ConfigDict(frozen=True)
 
     temperature: float | None = Field(default=None, ge=0.0, le=2.0)
     max_tokens: int | None = Field(default=None, gt=0)
+    enable_thinking: bool | None = None
 
     def to_payload(self) -> dict[str, Any]:
         payload: dict[str, Any] = {}
@@ -36,6 +43,8 @@ class GenerationOptions(BaseModel):
             payload["temperature"] = self.temperature
         if self.max_tokens is not None:
             payload["max_tokens"] = self.max_tokens
+        if self.enable_thinking is not None:
+            payload["chat_template_kwargs"] = {"enable_thinking": self.enable_thinking}
         return payload
 
 
