@@ -10,6 +10,12 @@ __pycache__/
 logs/
 *.log
 
+# local-only planning / memory documents — deliberately never published
+# (ENGINEERING_PLAN.md is the published plan; these are working copies)
+temp.md
+work.md
+PROJECT_MEMORY.md
+
 # generated artefacts
 eval/reports/*
 !eval/reports/.gitkeep

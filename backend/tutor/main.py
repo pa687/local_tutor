@@ -46,7 +46,7 @@ def create_app(
             if llama_client is None:
                 await client.aclose()
 
-    app = FastAPI(title="Local Tutor", version="0.0.2", lifespan=lifespan)
+    app = FastAPI(title="Local Tutor", version="0.0.3", lifespan=lifespan)
     app.state.config = resolved
     app.state.llama = client
 

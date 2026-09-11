@@ -361,7 +361,8 @@ class TutorEngine:
         student: StudentProfile,
         conversation: Conversation,
         message: UserMessage,
-    ) -> TutorResponse: ...
+    ) -> TutorResponse:
+        ...
 ```
 
 TutorResponse 至少包含：

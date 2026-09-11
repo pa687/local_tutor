@@ -3,7 +3,8 @@
 完全本地运行的初高中 AI 家教系统。单用户 / 少量用户，`llama-server` 是唯一主推理后端。
 
 - **权威计划**：[`ENGINEERING_PLAN.md`](ENGINEERING_PLAN.md)（`temp.md` 定稿）。其中 **§0–§23、§27 为权威**；§24–§26 是写给 Coding Agent 的示例任务，**仅供参考，非权威**。
-- **阶段顺序与 DoD**：见 `work.md`（在工作区 `~/models/`，不属于本仓库）。
+- **阶段顺序与 DoD**：见本地文件 `work.md`（**不入库**）。
+- **本地专用文档（故意不提交）**：`work.md`（阶段顺序 / DoD / 裁决记录）、`temp.md`（计划原件）、`PROJECT_MEMORY.md`（项目记忆：约定、环境、踩坑、进度）。
 
 ## 当前状态
 
