@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.py[cod]
+.env
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# generated artefacts
+eval/reports/*
+!eval/reports/.gitkeep
+
+# frontend (Phase 11)
+frontend/node_modules/
+frontend/dist/

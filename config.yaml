@@ -1,0 +1,25 @@
+# Local Tutor configuration — ENGINEERING_PLAN.md §19
+#
+# Every value below can be overridden by an environment variable named
+#   LOCAL_TUTOR__<SECTION>__<KEY>
+# e.g. LOCAL_TUTOR__LLM__MODEL=qwen3.6-27b
+# Values are parsed as YAML scalars, so `true`, `65536` and `qwen3.5-9b` all work.
+#
+# Never hardcode model paths or other absolute paths in Python code: put them here
+# or in the environment (§1.5 / §23.6).
+
+llm:
+  base_url: http://127.0.0.1:8080
+  model: qwen3.5-9b
+  timeout: 180
+
+tutor:
+  default_mode: tutor
+  max_verification_attempts: 2
+
+memory:
+  recent_turns: 30
+
+retrieval:
+  enabled: false
+  top_k: 6
