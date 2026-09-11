@@ -1,19 +1,21 @@
 """FastAPI application entry point (ENGINEERING_PLAN.md §4, §16).
 
-Phase 0 scope: application factory, ``request_id`` middleware, and the ``/health``
-placeholder. No LLM calls and no business logic live here.
+Owns the application factory, the ``request_id`` middleware (§18) and the lifetime
+of the shared :class:`~tutor.llm.client.LlamaClient`.
 """
 
 from __future__ import annotations
 
 import time
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request, Response
 
-from tutor.api import health
+from tutor.api import chat, health
 from tutor.config import AppConfig, get_config
+from tutor.llm.client import LlamaClient
 from tutor.logging_config import (
     REQUEST_ID_HEADER,
     RequestLogRecord,
@@ -23,11 +25,30 @@ from tutor.logging_config import (
 )
 
 
-def create_app(config: AppConfig | None = None) -> FastAPI:
-    """Build the FastAPI application. ``config`` overrides the process configuration."""
+def create_app(
+    config: AppConfig | None = None,
+    llama_client: LlamaClient | None = None,
+) -> FastAPI:
+    """Build the FastAPI application.
+
+    ``config`` overrides the process configuration; ``llama_client`` (mainly for
+    tests) overrides the client that would otherwise be built from that config.
+    """
     setup_logging()
-    app = FastAPI(title="Local Tutor", version="0.0.1")
-    app.state.config = config if config is not None else get_config()
+    resolved = config if config is not None else get_config()
+    client = llama_client if llama_client is not None else LlamaClient(resolved.llm)
+
+    @asynccontextmanager
+    async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        try:
+            yield
+        finally:
+            if llama_client is None:
+                await client.aclose()
+
+    app = FastAPI(title="Local Tutor", version="0.0.2", lifespan=lifespan)
+    app.state.config = resolved
+    app.state.llama = client
 
     @app.middleware("http")
     async def attach_request_context(
@@ -52,6 +73,7 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         return response
 
     app.include_router(health.router)
+    app.include_router(chat.router)
     return app
 
 

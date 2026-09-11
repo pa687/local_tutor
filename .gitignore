@@ -6,6 +6,10 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 
+# llama-server runtime output (§5)
+logs/
+*.log
+
 # generated artefacts
 eval/reports/*
 !eval/reports/.gitkeep

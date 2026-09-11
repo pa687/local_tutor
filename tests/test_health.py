@@ -1,27 +1,58 @@
-"""Tests for the Phase 0 ``/health`` placeholder (ENGINEERING_PLAN.md §16)."""
+"""Tests for ``GET /health`` (ENGINEERING_PLAN.md §16, §5 DoD)."""
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
+import httpx
 from fastapi.testclient import TestClient
 
 from tutor.config import AppConfig, LLMConfig
+from tutor.llm.client import LlamaClient
 from tutor.main import create_app
 
+Factory = Callable[..., LlamaClient]
 
-def test_health_reports_backend_ok(client: TestClient) -> None:
+
+def test_backend_ok_and_llama_down_when_unreachable(client: TestClient) -> None:
+    """The API stays up and honest while the model backend is gone."""
     response = client.get("/health")
     assert response.status_code == 200
     assert response.json() == {
         "backend": "ok",
-        "llama": "unknown",
+        "llama": "down",
         "model": "qwen3.5-9b",
         "context_size": None,
     }
 
 
-def test_health_reflects_injected_config() -> None:
-    config = AppConfig(llm=LLMConfig(model="qwen3.6-27b"))
-    with TestClient(create_app(config)) as test_client:
+def test_llama_ok_reports_real_context_size(
+    test_config: AppConfig, llama_client_factory: Factory
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/health":
+            return httpx.Response(200, json={"status": "ok"})
+        return httpx.Response(
+            200,
+            json={"model_alias": "qwen3.5-9b", "default_generation_settings": {"n_ctx": 65536}},
+        )
+
+    llama = llama_client_factory(handler)
+    with TestClient(create_app(test_config, llama_client=llama)) as test_client:
+        assert test_client.get("/health").json() == {
+            "backend": "ok",
+            "llama": "ok",
+            "model": "qwen3.5-9b",
+            "context_size": 65536,
+        }
+
+
+def test_health_reflects_injected_config(
+    llama_client_factory: Factory,
+    offline_llama: LlamaClient,
+) -> None:
+    config = AppConfig(llm=LLMConfig(base_url="http://llama.test", model="qwen3.6-27b"))
+    with TestClient(create_app(config, llama_client=offline_llama)) as test_client:
         assert test_client.get("/health").json()["model"] == "qwen3.6-27b"
 
 

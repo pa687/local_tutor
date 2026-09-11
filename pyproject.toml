@@ -1,6 +1,6 @@
 [project]
 name = "local-tutor"
-version = "0.0.1"
+version = "0.0.2"
 description = "Fully local AI tutor for middle/high-school students (FastAPI + llama.cpp)"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
@@ -47,6 +47,8 @@ select = ["E", "F", "I", "UP", "B", "S"]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["S101"]
+# Dev-only benchmark helper: it shells out to nvidia-smi with a fixed argument list.
+"scripts/bench_llama.py" = ["S603", "S607"]
 
 [tool.mypy]
 python_version = "3.12"

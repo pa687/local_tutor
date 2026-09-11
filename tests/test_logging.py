@@ -97,7 +97,7 @@ def test_middleware_logs_metadata_even_when_the_route_is_missing(
     """A failed request is still logged as metadata, still without its content."""
     caplog.set_level(logging.INFO, logger="tutor.request")
     question_marker = "MARKER-STUDENT-QUESTION-43"
-    response = client.post("/api/chat", json={"message": question_marker})
+    response = client.post("/api/not-implemented", json={"message": question_marker})
 
     assert response.status_code == 404
     records = _tutor_request_records(caplog)
